@@ -365,6 +365,85 @@ export async function getPaymentByBookingId(bookingId: string): Promise<Payment 
   return data ? rowToPayment(data) : null;
 }
 
+// ─── Deployment health verification ───────────────────────────────────────────
+
+export interface PaymentConfigHealth {
+  /** True when every configuration invariant below holds. */
+  healthy: boolean;
+  /** Canonical statuses the state machine recognises. */
+  statuses: PaymentStatus[];
+  /** Number of allowed forward transitions defined in the graph. */
+  transitionCount: number;
+  /** Provider status keys mapped to canonical statuses. */
+  providerStatusKeys: string[];
+  /** Human-readable problems; empty when healthy. */
+  issues: string[];
+}
+
+/**
+ * Read-only verification of the payment state machine and configuration.
+ *
+ * Intended for deployment health gates: it performs no database writes, never
+ * creates payment intents, and never submits transactions, so it is safe to
+ * run against production. It only inspects the in-process configuration.
+ *
+ * @returns A snapshot describing configuration health and any detected issues.
+ */
+export function verifyPaymentConfiguration(): PaymentConfigHealth {
+  const issues: string[] = [];
+  const statuses = Object.keys(ALLOWED_TRANSITIONS) as PaymentStatus[];
+
+  // Every canonical status must have an entry in the transition graph.
+  for (const status of statuses) {
+    if (!Array.isArray(ALLOWED_TRANSITIONS[status])) {
+      issues.push(`Missing transition entry for status "${status}"`);
+    }
+  }
+
+  // Every transition target must itself be a known status.
+  let transitionCount = 0;
+  for (const from of statuses) {
+    for (const to of ALLOWED_TRANSITIONS[from] ?? []) {
+      transitionCount += 1;
+      if (!statuses.includes(to)) {
+        issues.push(`Transition "${from}" → "${to}" targets an unknown status`);
+      }
+    }
+  }
+
+  // Terminal states must not allow any outgoing transitions.
+  for (const terminal of ['failed', 'refunded'] as const) {
+    if ((ALLOWED_TRANSITIONS[terminal] ?? []).length > 0) {
+      issues.push(`Terminal status "${terminal}" must not allow outgoing transitions`);
+    }
+  }
+
+  // Provider status map must resolve to known canonical statuses.
+  const providerStatusKeys = Object.keys(PROVIDER_STATUS_MAP);
+  for (const key of providerStatusKeys) {
+    const mapped = PROVIDER_STATUS_MAP[key];
+    if (!statuses.includes(mapped)) {
+      issues.push(`Provider status "${key}" maps to unknown status "${mapped}"`);
+    }
+  }
+
+  // The happy path must be reachable end-to-end.
+  if (!isAllowedTransition('pending', 'submitted')) {
+    issues.push('Happy path "pending" → "submitted" is not allowed');
+  }
+  if (!isAllowedTransition('submitted', 'confirmed')) {
+    issues.push('Happy path "submitted" → "confirmed" is not allowed');
+  }
+
+  return {
+    healthy: issues.length === 0,
+    statuses,
+    transitionCount,
+    providerStatusKeys,
+    issues,
+  };
+}
+
 // ─── Row mapping ──────────────────────────────────────────────────────────────
 
 /**

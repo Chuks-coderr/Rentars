@@ -36,6 +36,109 @@ import {
   type SupportedCurrency,
 } from '@/utils/payment.utils.js';
 import { supabase } from '@/config/supabase.js';
+import { env } from '@/config/env.js';
+
+// ─── Deployment health gate: payment configuration ─────────────────────────────
+
+/**
+ * Read-only payment configuration check used by the deployment health gate
+ * (#1018).
+ *
+ * Verifies that payment settings are coherent — supported currency, quote
+ * signing (HMAC round-trip), and the configured Stellar network — without
+ * creating payment intents, touching the database, or transferring funds.
+ *
+ * Returns a report of individual checks; `ok` is true only when every
+ * required check passes. Callers (smoke tests / promotion gates) should treat
+ * a non-ok report as a blocking failure.
+ */
+export interface PaymentConfigCheck {
+  name: string;
+  ok: boolean;
+  detail?: string;
+}
+
+export interface PaymentConfigReport {
+  ok: boolean;
+  checks: PaymentConfigCheck[];
+}
+
+const PAYMENT_CONFIG_PROBE_BOOKING_ID = '00000000-0000-4000-8000-000000000000';
+
+export function checkPaymentConfiguration(): PaymentConfigReport {
+  const checks: PaymentConfigCheck[] = [];
+
+  // 1. Supported currency is USDC only.
+  const currency: SupportedCurrency = 'USDC';
+  checks.push({
+    name: 'currency',
+    ok: currency === 'USDC',
+    detail: `supported currency: ${currency}`,
+  });
+
+  // 2. Quote signing round-trip: a freshly signed quote must verify, and a
+  //    tampered amount must be rejected. No payment intent is created.
+  try {
+    const probeStroops = 1n; // 0.0000001 USDC — never submitted on-chain
+    const expiresAt = new Date(Date.now() + QUOTE_EXPIRY_MINUTES * 60 * 1000).toISOString();
+    const hash = signQuote(PAYMENT_CONFIG_PROBE_BOOKING_ID, probeStroops, currency, expiresAt);
+    const verifies = verifyQuote(hash, PAYMENT_CONFIG_PROBE_BOOKING_ID, probeStroops, currency, expiresAt);
+    const rejectsTampered = !verifyQuote(
+      hash,
+      PAYMENT_CONFIG_PROBE_BOOKING_ID,
+      probeStroops + 1n,
+      currency,
+      expiresAt,
+    );
+    checks.push({
+      name: 'quote_signing',
+      ok: verifies && rejectsTampered,
+      detail: verifies && rejectsTampered
+        ? 'quote sign/verify round-trip ok'
+        : 'quote signing misconfigured (round-trip or tamper check failed)',
+    });
+  } catch (err) {
+    checks.push({
+      name: 'quote_signing',
+      ok: false,
+      detail: err instanceof Error ? err.message : 'quote signing check threw',
+    });
+  }
+
+  // 3. Stellar network configuration is present and recognised.
+  const network = env.STELLAR_NETWORK;
+  const knownNetworks = ['testnet', 'mainnet', 'futurenet', 'standalone'];
+  checks.push({
+    name: 'stellar_network',
+    ok: typeof network === 'string' && knownNetworks.includes(network),
+    detail: `network: ${network ?? 'unset'}`,
+  });
+
+  // 4. Amount validation rejects malformed input (guards against regressions
+  //    that would let clients submit arbitrary amounts).
+  const invalidErrors = validatePaymentAmount('not-a-number', currency);
+  checks.push({
+    name: 'amount_validation',
+    ok: invalidErrors.length > 0,
+    detail: invalidErrors.length > 0
+      ? 'malformed amounts rejected'
+      : 'amount validation accepted malformed input',
+  });
+
+  return { ok: checks.every((c) => c.ok), checks };
+}
+
+/**
+ * GET /api/v1/payments/health/config
+ *
+ * Deployment health gate endpoint. Read-only: never creates payment intents,
+ * bookings, or on-chain transactions. Returns 200 when payment configuration
+ * is coherent, 503 otherwise so traffic promotion is blocked.
+ */
+export async function getPaymentConfigHealth(_req: AuthRequest, res: Response): Promise<void> {
+  const report = checkPaymentConfiguration();
+  res.status(report.ok ? 200 : 503).json(report);
+}
 
 // ─── Quote generation ──────────────────────────────────────────────────────────
 
