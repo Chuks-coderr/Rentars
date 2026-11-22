@@ -5,67 +5,136 @@ import { redisClient } from '@/config/redis.js';
 import { loggingService } from '@/services/logging.service.js';
 import { rateLimitStore } from '@/services/rateLimitStore.service.js';
 import { rateLimitMetrics } from '@/services/rateLimitMetrics.service.js';
+import { redisKeys } from '@/config/redisKeys.js';
+import { getClientIp } from '@/utils/trustProxy.js';
 
 export interface AuthRequest extends Request {
   userId?: string;
 }
 
-// Rate limiter instances
-let generalLimiter: RateLimiterRedis | RateLimiterMemory;
-let authLimiter: RateLimiterRedis | RateLimiterMemory;
-let bookingLimiter: RateLimiterRedis | RateLimiterMemory;
-let blockchainLimiter: RateLimiterRedis | RateLimiterMemory;
-let messageLimiter: RateLimiterRedis | RateLimiterMemory;
+/**
+ * Identity class used to scope a rate-limit budget.
+ * - `user`: authenticated caller, keyed by user id.
+ * - `ip`: anonymous caller, keyed by the validated client IP.
+ */
+export type IdentityClass = 'user' | 'ip';
+
+/**
+ * Endpoint class used to select a rate-limit budget.
+ * Each class has its own independent budget so that, e.g., a burst of
+ * searches cannot exhaust the login budget.
+ */
+export type EndpointClass =
+  | 'login'
+  | 'search'
+  | 'upload'
+  | 'message'
+  | 'expensive'
+  | 'general';
+
+export interface RateLimitPolicy {
+  /** Endpoint class this policy applies to. */
+  endpoint: EndpointClass;
+  /** Identity class used to derive the limiter key. */
+  identity: IdentityClass;
+  /** Maximum number of requests allowed within the window. */
+  points: number;
+  /** Window length in seconds. */
+  durationSeconds: number;
+}
+
+/**
+ * Default budgets per endpoint class. Anonymous callers get a tighter budget
+ * than authenticated users for the same endpoint class.
+ */
+export const DEFAULT_POLICIES: Record<EndpointClass, { user: RateLimitPolicy; ip: RateLimitPolicy }> = {
+  login: {
+    user: { endpoint: 'login', identity: 'user', points: 10, durationSeconds: 60 },
+    ip: { endpoint: 'login', identity: 'ip', points: 10, durationSeconds: 60 },
+  },
+  search: {
+    user: { endpoint: 'search', identity: 'user', points: 120, durationSeconds: 60 },
+    ip: { endpoint: 'search', identity: 'ip', points: 30, durationSeconds: 60 },
+  },
+  upload: {
+    user: { endpoint: 'upload', identity: 'user', points: 20, durationSeconds: 60 },
+    ip: { endpoint: 'upload', identity: 'ip', points: 5, durationSeconds: 60 },
+  },
+  message: {
+    user: { endpoint: 'message', identity: 'user', points: 60, durationSeconds: 60 },
+    ip: { endpoint: 'message', identity: 'ip', points: 10, durationSeconds: 60 },
+  },
+  expensive: {
+    user: { endpoint: 'expensive', identity: 'user', points: 20, durationSeconds: 60 },
+    ip: { endpoint: 'expensive', identity: 'ip', points: 5, durationSeconds: 60 },
+  },
+  general: {
+    user: { endpoint: 'general', identity: 'user', points: 300, durationSeconds: 60 },
+    ip: { endpoint: 'general', identity: 'ip', points: 100, durationSeconds: 60 },
+  },
+};
 
 const useRedis = !!process.env.REDIS_URL;
 
-if (useRedis) {
-  generalLimiter = new RateLimiterRedis({
-    storeClient: redisClient,
-    keyPrefix: 'rl:general',
-    points: 100,
-    duration: 60,
-  });
+type Limiter = RateLimiterRedis | RateLimiterMemory;
 
-  authLimiter = new RateLimiterRedis({
-    storeClient: redisClient,
-    keyPrefix: 'rl:auth',
-    points: 10,
-    duration: 60,
+/**
+ * Build a limiter for a policy. Redis key namespacing is centralized in
+ * `redisKeys.rateLimit` so every instance (and every endpoint class) shares
+ * the same key layout across the fleet.
+ */
+function buildLimiter(policy: RateLimitPolicy): Limiter {
+  const keyPrefix = redisKeys.rateLimit(policy.endpoint, policy.identity);
+  if (useRedis) {
+    return new RateLimiterRedis({
+      storeClient: redisClient,
+      keyPrefix,
+      points: policy.points,
+      duration: policy.durationSeconds,
+    });
+  }
+  return new RateLimiterMemory({
+    keyPrefix,
+    points: policy.points,
+    duration: policy.durationSeconds,
   });
+}
 
-  bookingLimiter = new RateLimiterRedis({
-    storeClient: redisClient,
-    keyPrefix: 'rl:booking',
-    points: 5,
-    duration: 60,
-  });
+const limiterCache = new Map<string, Limiter>();
 
-  blockchainLimiter = new RateLimiterRedis({
-    storeClient: redisClient,
-    keyPrefix: 'rl:blockchain',
-    points: 20,
-    duration: 60,
-  });
+function getLimiter(policy: RateLimitPolicy): Limiter {
+  const cacheKey = `${policy.endpoint}:${policy.identity}`;
+  let limiter = limiterCache.get(cacheKey);
+  if (!limiter) {
+    limiter = buildLimiter(policy);
+    limiterCache.set(cacheKey, limiter);
+  }
+  return limiter;
+}
 
-  messageLimiter = new RateLimiterRedis({
-    storeClient: redisClient,
-    keyPrefix: 'rl:message',
-    points: 10,
-    duration: 60,
-  });
-} else {
-  generalLimiter = new RateLimiterMemory({ points: 100, duration: 60 });
-  authLimiter = new RateLimiterMemory({ points: 10, duration: 60 });
-  bookingLimiter = new RateLimiterMemory({ points: 5, duration: 60 });
-  blockchainLimiter = new RateLimiterMemory({ points: 20, duration: 60 });
-  messageLimiter = new RateLimiterMemory({ points: 10, duration: 60 });
+// Pre-build the default limiter set so instances are created eagerly.
+for (const endpoint of Object.keys(DEFAULT_POLICIES) as EndpointClass[]) {
+  getLimiter(DEFAULT_POLICIES[endpoint].user);
+  getLimiter(DEFAULT_POLICIES[endpoint].ip);
 }
 
 function setRateLimitHeaders(res: Response, limiterRes: any): void {
   res.setHeader('X-RateLimit-Limit', limiterRes.consumedPoints);
   res.setHeader('X-RateLimit-Remaining', limiterRes.remainingPoints);
   res.setHeader('X-RateLimit-Reset', new Date(Date.now() + limiterRes.msBeforeNext).toISOString());
+}
+
+/**
+ * Resolve the identity used to key a request.
+ * Authenticated callers are keyed by user id; anonymous callers by the
+ * validated client IP (never a raw, spoofable forwarded header).
+ */
+export function resolveIdentity(req: AuthRequest): { identity: IdentityClass; key: string } {
+  const userId = req.user?.id ?? req.userId;
+  if (userId) {
+    return { identity: 'user', key: `user:${userId}` };
+  }
+  return { identity: 'ip', key: `ip:${getClientIp(req)}` };
 }
 
 /**
@@ -113,7 +182,8 @@ async function handleRejection(
   message: string,
 ): Promise<void> {
   setRateLimitHeaders(res, limiterRes);
-  res.setHeader('Retry-After', Math.ceil(limiterRes.msBeforeNext / 1000));
+  const retryAfterSeconds = Math.max(1, Math.ceil(limiterRes.msBeforeNext / 1000));
+  res.setHeader('Retry-After', retryAfterSeconds);
 
   // Record the rejection — identity is hashed for privacy
   const hashedIdentity = hashIdentity(rawIdentity);
@@ -150,81 +220,94 @@ async function handleRejection(
       code: 'RATE_LIMIT_EXCEEDED',
       message,
       details: {
-        retryAfter: Math.ceil(limiterRes.msBeforeNext / 1000) + Math.ceil(progressiveDelay / 1000),
+        retryAfter: retryAfterSeconds + Math.ceil(progressiveDelay / 1000),
       },
     },
   });
 }
 
-export function generalRateLimiter(req: Request, res: Response, next: NextFunction): void {
-  const key = req.ip || 'unknown';
+/**
+ * Factory that creates a rate-limiter middleware for a given endpoint class.
+ *
+ * The identity class is resolved per request: authenticated callers are keyed
+ * by user id, anonymous callers by the validated client IP. Each endpoint
+ * class has its own independent budget (see `DEFAULT_POLICIES`).
+ */
+export function createRateLimiter(
+  endpoint: EndpointClass,
+  overrides?: Partial<Record<IdentityClass, Partial<RateLimitPolicy>>>,
+  message?: string,
+): (req: AuthRequest, res: Response, next: NextFunction) => void {
+  const policies = DEFAULT_POLICIES[endpoint];
+  const userPolicy: RateLimitPolicy = { ...policies.user, ...(overrides?.user ?? {}) };
+  const ipPolicy: RateLimitPolicy = { ...policies.ip, ...(overrides?.ip ?? {}) };
 
-  generalLimiter
-    .consume(key)
-    .then((limiterRes) => {
-      setRateLimitHeaders(res, limiterRes);
-      next();
-    })
-    .catch((limiterRes) => {
-      handleRejection(req, res, limiterRes, 'general', key, 'Too many requests, please try again later.');
-    });
+  const userLimiter = getLimiter(userPolicy);
+  const ipLimiter = getLimiter(ipPolicy);
+
+  const rejectionMessage = message ?? 'Too many requests, please try again later.';
+
+  return function rateLimiterMiddleware(
+    req: AuthRequest,
+    res: Response,
+    next: NextFunction,
+  ): void {
+    const { identity, key } = resolveIdentity(req);
+    const limiter = identity === 'user' ? userLimiter : ipLimiter;
+
+    limiter
+      .consume(key)
+      .then((limiterRes) => {
+        setRateLimitHeaders(res, limiterRes);
+        next();
+      })
+      .catch((limiterRes) => {
+        handleRejection(req, res, limiterRes, endpoint, key, rejectionMessage);
+      });
+  };
 }
 
-export function authRateLimiter(req: Request, res: Response, next: NextFunction): void {
-  const key = req.ip || 'unknown';
+export const generalRateLimiter = createRateLimiter(
+  'general',
+  undefined,
+  'Too many requests, please try again later.',
+);
 
-  authLimiter
-    .consume(key)
-    .then((limiterRes) => {
-      setRateLimitHeaders(res, limiterRes);
-      next();
-    })
-    .catch((limiterRes) => {
-      handleRejection(req, res, limiterRes, 'auth', key, 'Too many authentication requests, please try again later.');
-    });
-}
+export const authRateLimiter = createRateLimiter(
+  'login',
+  undefined,
+  'Too many authentication requests, please try again later.',
+);
 
-export function bookingRateLimiter(req: AuthRequest, res: Response, next: NextFunction): void {
-  const key = req.userId || req.ip || 'unknown';
+export const searchRateLimiter = createRateLimiter(
+  'search',
+  undefined,
+  'Too many search requests, please slow down.',
+);
 
-  bookingLimiter
-    .consume(key)
-    .then((limiterRes) => {
-      setRateLimitHeaders(res, limiterRes);
-      next();
-    })
-    .catch((limiterRes) => {
-      handleRejection(req, res, limiterRes, 'booking', key, 'Too many booking requests, please try again later.');
-    });
-}
+export const uploadRateLimiter = createRateLimiter(
+  'upload',
+  undefined,
+  'Too many upload requests, please try again later.',
+);
 
-export function blockchainRateLimiter(req: AuthRequest, res: Response, next: NextFunction): void {
-  const key = req.userId || req.ip || 'unknown';
+export const bookingRateLimiter = createRateLimiter(
+  'expensive',
+  undefined,
+  'Too many booking requests, please try again later.',
+);
 
-  blockchainLimiter
-    .consume(key)
-    .then((limiterRes) => {
-      setRateLimitHeaders(res, limiterRes);
-      next();
-    })
-    .catch((limiterRes) => {
-      handleRejection(req, res, limiterRes, 'blockchain', key, 'Too many blockchain operations, please try again later.');
-    });
-}
+export const blockchainRateLimiter = createRateLimiter(
+  'expensive',
+  undefined,
+  'Too many blockchain operations, please try again later.',
+);
 
-export function messageRateLimiter(req: AuthRequest, res: Response, next: NextFunction): void {
-  const key = req.userId || req.ip || 'unknown';
-
-  messageLimiter
-    .consume(key)
-    .then((limiterRes) => {
-      setRateLimitHeaders(res, limiterRes);
-      next();
-    })
-    .catch((limiterRes) => {
-      handleRejection(req, res, limiterRes, 'message', key, 'Too many messages sent, please slow down.');
-    });
-}
+export const messageRateLimiter = createRateLimiter(
+  'message',
+  undefined,
+  'Too many messages sent, please slow down.',
+);
 
 /**
  * Factory that creates a per-user rate-limiter middleware.
@@ -257,22 +340,26 @@ export function createUserRateLimiter({
 }): (req: AuthRequest, res: Response, next: NextFunction) => void {
   const durationSeconds = Math.ceil(windowMs / 1000);
 
+  // Namespace the custom limiter through the centralized key builder so it
+  // shares the same layout as the built-in endpoint classes across instances.
+  const namespacedPrefix = redisKeys.rateLimitCustom(keyPrefix);
+
   const limiter: RateLimiterRedis | RateLimiterMemory = useRedis
     ? new RateLimiterRedis({
         storeClient: redisClient,
-        keyPrefix,
+        keyPrefix: namespacedPrefix,
         points: max,
         duration: durationSeconds,
       })
-    : new RateLimiterMemory({ keyPrefix, points: max, duration: durationSeconds });
+    : new RateLimiterMemory({ keyPrefix: namespacedPrefix, points: max, duration: durationSeconds });
 
   return function userRateLimiterMiddleware(
     req: AuthRequest,
     res: Response,
     next: NextFunction,
   ): void {
-    // Prefer authenticated user id; fall back to IP for unauthenticated callers.
-    const rawIdentity = req.user?.id ?? req.userId ?? req.ip ?? 'unknown';
+    // Prefer authenticated user id; fall back to the validated client IP.
+    const { key: rawIdentity } = resolveIdentity(req);
 
     limiter
       .consume(rawIdentity)
