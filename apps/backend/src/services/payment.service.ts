@@ -39,6 +39,10 @@
 import { createHash } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import { auditLogger } from './auditLogger.service.js';
+import {
+  paymentWorkflowTotal,
+  paymentWorkflowDurationSeconds,
+} from '@/observability/metrics.js';
 import type { ServiceResponse } from './index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -149,6 +153,25 @@ export function mapProviderStatus(raw: string): PaymentStatus {
   return PROVIDER_STATUS_MAP[raw] ?? 'under_review';
 }
 
+/**
+ * Classify the external provider that produced an event into a bounded,
+ * low-cardinality label value. Never derive this from IDs or free-form data.
+ */
+function providerClassFor(payload: Record<string, unknown>): 'stellar' | 'escrow' | 'unknown' {
+  const source = payload._source;
+  if (typeof source === 'string') {
+    if (source === 'stellar_confirmation' || source === 'stellar') return 'stellar';
+    if (source === 'escrow' || source === 'trustlesswork') return 'escrow';
+  }
+  if (typeof payload.stellar_tx_hash === 'string' || typeof payload.txHash === 'string') {
+    return 'stellar';
+  }
+  if (typeof payload.escrow_id === 'string' || typeof payload.escrowId === 'string') {
+    return 'escrow';
+  }
+  return 'unknown';
+}
+
 // ─── Service functions ────────────────────────────────────────────────────────
 
 /**
@@ -228,6 +251,7 @@ export async function transitionPaymentStatus(
   }
 
   const eventHash = hashEventPayload(eventPayload);
+  const providerClass = providerClassFor(eventPayload);
 
   // ── Idempotency: same event hash → replay without side-effects ────────────
   if (payment.last_event_hash === eventHash) {
@@ -264,6 +288,10 @@ export async function transitionPaymentStatus(
     };
   }
 
+  const stopTimer = paymentWorkflowDurationSeconds.startTimer({
+    operation: 'transition',
+  });
+
   const { data, error } = await supabase
     .from('payments')
     .update(updatePayload)
@@ -271,6 +299,8 @@ export async function transitionPaymentStatus(
     .eq('version', payment.version) // optimistic concurrency guard
     .select()
     .single();
+
+  stopTimer();
 
   if (error || !data) {
     // Version conflict — another process transitioned first
@@ -281,6 +311,13 @@ export async function transitionPaymentStatus(
   }
 
   const updated = rowToPayment(data);
+
+  // ── Metrics: exactly one increment per applied (non-replayed) transition ──
+  paymentWorkflowTotal.inc({
+    operation: 'transition',
+    outcome: targetStatus,
+    provider_class: providerClass,
+  });
 
   // ── Audit ─────────────────────────────────────────────────────────────────
   const auditAction =

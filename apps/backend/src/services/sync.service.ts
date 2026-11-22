@@ -25,6 +25,34 @@ import { supabase } from '@/config/supabase.js';
 import { enqueueNotificationOutbox } from './notification.service.js';
 import type { ServiceResponse } from './index.js';
 import type { Booking as BookingDBRow } from '@/services/booking.service.js';
+import {
+  syncWorkflowTotal,
+  syncWorkflowDurationSeconds,
+  syncRetriesTotal,
+} from '@/metrics/index.js';
+
+/**
+ * Bounded metric vocabulary for the sync/reconciliation workflow.
+ * Labels are intentionally low-cardinality: never include booking IDs,
+ * escrow hashes, transaction hashes, or any other per-entity identifier.
+ */
+const SYNC_WORKFLOW = 'escrow_reconcile' as const;
+type SyncWorkflowOutcome = 'success' | 'failed' | 'skipped' | 'quarantined';
+
+function recordSyncOutcome(outcome: SyncWorkflowOutcome): void {
+  syncWorkflowTotal.inc({ workflow: SYNC_WORKFLOW, outcome });
+}
+
+function recordSyncRetry(): void {
+  syncRetriesTotal.inc({ workflow: SYNC_WORKFLOW });
+}
+
+function observeSyncDuration(startedAt: number): void {
+  syncWorkflowDurationSeconds.observe(
+    { workflow: SYNC_WORKFLOW },
+    (Date.now() - startedAt) / 1000,
+  );
+}
 
 type SyncStatus = 'success' | 'failed' | 'skipped';
 
@@ -391,9 +419,11 @@ async function reconcilePendingEscrow(
   },
 ): Promise<void> {
   if (!booking.escrow_hash || !booking.on_chain_id) {
+    recordSyncOutcome('skipped');
     return;
   }
 
+  const startedAt = Date.now();
   const currentAttempt = (booking.reconcile_attempts ?? 0) + 1;
   const attemptId = randomUUID();
   const { error: attemptInsertError } = await supabase
@@ -407,7 +437,12 @@ async function reconcilePendingEscrow(
     });
   if (attemptInsertError) {
     // A duplicate attempt number means another worker already claimed this run.
-    if (attemptInsertError.code === '23505') return;
+    if (attemptInsertError.code === '23505') {
+      recordSyncOutcome('skipped');
+      return;
+    }
+    recordSyncOutcome('failed');
+    observeSyncDuration(startedAt);
     throw new Error(`Failed to persist reconciliation attempt: ${attemptInsertError.message}`);
   }
 
@@ -421,6 +456,8 @@ async function reconcilePendingEscrow(
     })
     .eq('id', booking.id);
   if (attemptUpdateError) {
+    recordSyncOutcome('failed');
+    observeSyncDuration(startedAt);
     throw new Error(`Failed to update reconciliation counter: ${attemptUpdateError.message}`);
   }
 
@@ -474,7 +511,13 @@ async function reconcilePendingEscrow(
           'Exceeded max attempts while pending',
           attemptId,
         );
+        recordSyncOutcome('quarantined');
+      } else {
+        // Still pending and below the ceiling — a retry has been scheduled.
+        recordSyncRetry();
+        recordSyncOutcome('success');
       }
+      observeSyncDuration(startedAt);
       return;
     }
 
@@ -509,6 +552,8 @@ async function reconcilePendingEscrow(
       if (wasFailing) {
         await notifyEscrowOutcome(booking.id, 'recovered', currentAttempt);
       }
+      recordSyncOutcome('success');
+      observeSyncDuration(startedAt);
       return;
     }
 
@@ -531,6 +576,8 @@ async function reconcilePendingEscrow(
         'On-chain transaction failed',
         attemptId,
       );
+      recordSyncOutcome('quarantined');
+      observeSyncDuration(startedAt);
     }
   } catch (err) {
     const message = (err as Error).message;
@@ -570,9 +617,14 @@ async function reconcilePendingEscrow(
 
     if (!nextRetryAt) {
       await quarantineBooking(booking.id, booking.escrow_hash, currentAttempt, message, attemptId);
+      recordSyncOutcome('quarantined');
+    } else {
+      // Transient, below threshold: schedule a backed-off retry.
+      recordSyncRetry();
+      recordSyncOutcome('failed');
     }
 
-    // Transient, below threshold: schedule a backed-off retry.
+    observeSyncDuration(startedAt);
     await scheduleNextAttempt(booking.id, currentAttempt);
   }
 }

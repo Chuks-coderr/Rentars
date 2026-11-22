@@ -38,8 +38,11 @@ import type { CursorPaginatedResult } from './notification.service.js';
 import type { ServiceResponse } from './index.js';
 import {
   incCounter,
+  observeHistogram,
   bookingsCreatedTotal,
   escrowFailuresTotal,
+  bookingWorkflowTotal,
+  bookingWorkflowDurationSeconds,
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
 import { calculateRangePrice, pricingSnapshotFromQuote } from './pricing.service.js';
@@ -704,6 +707,19 @@ export class BookingService {
    *   7. Create on-chain booking record
    */
   async createBooking(input: CreateBookingInput): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.createBookingInner(input);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'create',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'create',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async createBookingInner(input: CreateBookingInput): Promise<ServiceResponse<Booking>> {
     const { property_id, tenant_id, check_in, check_out, guest_count, total_price, rules_acknowledged_at, terms_version, terms_accepted_at } = input;
 
     if (!property_id || !tenant_id || !check_in || !check_out) {
@@ -1042,7 +1058,8 @@ export class BookingService {
     createNotification(tenant_id, 'booking_created', { booking_id: booking.id, property_id }).catch(
       () => {},
     );
-    incCounter(bookingsCreatedTotal, { property_id });
+    // Bounded label only — never the property/booking id (unbounded cardinality).
+    incCounter(bookingsCreatedTotal, { source: 'api' });
 
     // 8. Create on-chain booking record (non-fatal on failure).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
@@ -1124,6 +1141,24 @@ export class BookingService {
     bookingId: string,
     userId: string,
     now: Date = new Date(),
+    userRole?: string,
+  ): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.cancelBookingInner(bookingId, userId, now, userRole);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'cancel',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'cancel',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async cancelBookingInner(
+    bookingId: string,
+    userId: string,
+    now: Date,
     userRole?: string,
   ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
@@ -1426,6 +1461,23 @@ export class BookingService {
    * DB and on-chain status to Confirmed.
    */
   async confirmBooking(bookingId: string, userId: string, userRole?: string): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.confirmBookingInner(bookingId, userId, userRole);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'confirm',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'confirm',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async confirmBookingInner(
+    bookingId: string,
+    userId: string,
+    userRole?: string,
+  ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
     }
@@ -1531,6 +1583,23 @@ export class BookingService {
    * @param userId    - ID of the caller (must be the tenant)
    */
   async completeBooking(bookingId: string, userId: string, userRole?: string): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.completeBookingInner(bookingId, userId, userRole);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'complete',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'complete',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async completeBookingInner(
+    bookingId: string,
+    userId: string,
+    userRole?: string,
+  ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
     }

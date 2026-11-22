@@ -38,6 +38,7 @@
 
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { metrics } from '@/observability/metrics.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -273,6 +274,9 @@ export async function loadCursor(
  */
 export function measureLag(cursorKey: string, cursorValue: bigint, latestOnChain: bigint): LagReport {
     const lag = latestOnChain > cursorValue ? latestOnChain - cursorValue : 0n;
+    // Expose lag as a gauge.  `cursorKey` is a bounded worker identifier
+    // (e.g. "booking_sync"), never a user/booking/transaction ID.
+    metrics.ledgerSyncLagSeconds.set({ worker: cursorKey }, Number(lag));
     return { cursor_key: cursorKey, cursor_value: cursorValue, latest_on_chain: latestOnChain, lag };
 }
 
@@ -364,18 +368,32 @@ export async function processEventOnce(
     project: () => Promise<void>,
     { maxAttempts = 5 }: { maxAttempts?: number } = {},
 ): Promise<ServiceResponse<{ outcome: 'projected' | 'skipped' | 'dead_letter' }>> {
+    const startedAt = process.hrtime.bigint();
+    const workflowLabels = { workflow: 'ledger_event' } as const;
+
+    // Emit exactly one outcome counter + one duration observation per logical
+    // event.  Labels are bounded (workflow + outcome); event_key is never used.
+    const finish = (outcome: 'projected' | 'duplicate' | 'dead_letter' | 'failed') => {
+        metrics.syncWorkflowTotal.inc({ ...workflowLabels, outcome });
+        const elapsedSeconds = Number(process.hrtime.bigint() - startedAt) / 1e9;
+        metrics.syncWorkflowDurationSeconds.observe(workflowLabels, elapsedSeconds);
+    };
+
     // 1. Record in inbox — idempotent; duplicate delivery → isNew = false
     const inboxResult = await recordEventInbox(eventKey, workerId);
     if (!inboxResult.success) {
+        finish('failed');
         return { success: false, error: inboxResult.error };
     }
 
     // 2. Check if already projected (covers restarts that skip the inbox insert)
     const projectedResult = await isEventProjected(eventKey);
     if (!projectedResult.success) {
+        finish('failed');
         return { success: false, error: projectedResult.error };
     }
     if (projectedResult.data) {
+        finish('duplicate');
         return { success: true, data: { outcome: 'skipped' } };
     }
 
@@ -388,20 +406,24 @@ export async function processEventOnce(
             console.error(`[LedgerSync] Failed to mark ${eventKey} projected: ${markResult.error}`);
         }
 
+        finish('projected');
         return { success: true, data: { outcome: 'projected' } };
     } catch (err) {
         const message = (err as Error).message;
         const failureResult = await recordEventAttemptFailure(eventKey, message);
 
         if (!failureResult.success) {
+            finish('failed');
             return { success: false, error: failureResult.error };
         }
 
         if (failureResult.data.attempts >= maxAttempts) {
             await quarantineEvent(eventKey, message);
+            finish('dead_letter');
             return { success: true, data: { outcome: 'dead_letter' } };
         }
 
+        finish('failed');
         return { success: false, error: `Projection failed (attempt ${failureResult.data.attempts}): ${message}` };
     }
 }
