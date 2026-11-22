@@ -104,6 +104,52 @@ for (const abi of abiFiles) {
   }
 }
 
+// ── Contract upgradeability and upgrade authority ────────────────────────────
+// Mirrors the environment variables consumed by the backend contractRegistry so
+// operators can tell, from a release manifest alone, whether a deployed contract
+// can be upgraded and who may authorize it.
+const contractUpgradeability: Record<
+  string,
+  { upgradeable: boolean; upgrade_authority: string | null }
+> = {
+  property_listing: {
+    upgradeable: (process.env.PROPERTY_LISTING_UPGRADEABLE ?? 'false').toLowerCase() === 'true',
+    upgrade_authority: process.env.PROPERTY_LISTING_UPGRADE_AUTHORITY ?? null,
+  },
+  booking: {
+    upgradeable: (process.env.BOOKING_UPGRADEABLE ?? 'false').toLowerCase() === 'true',
+    upgrade_authority: process.env.BOOKING_UPGRADE_AUTHORITY ?? null,
+  },
+  review: {
+    upgradeable: (process.env.REVIEW_UPGRADEABLE ?? 'false').toLowerCase() === 'true',
+    upgrade_authority: process.env.REVIEW_UPGRADE_AUTHORITY ?? null,
+  },
+};
+
+// ── Contract compatibility check ─────────────────────────────────────────────
+// Runs the compatibility check script and records its outcome in the manifest so
+// client/contract incompatibility is visible before release.
+let compatibilityCheck: { status: string; exit_code: number | null; output: string | null } = {
+  status: 'not_run',
+  exit_code: null,
+  output: null,
+};
+try {
+  const output = execSync('bun run scripts/check-contract-compatibility.ts', {
+    cwd: ROOT,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  compatibilityCheck = { status: 'passed', exit_code: 0, output };
+} catch (err) {
+  const e = err as { status?: number | null; stdout?: string; stderr?: string };
+  compatibilityCheck = {
+    status: 'failed',
+    exit_code: e.status ?? null,
+    output: `${e.stdout ?? ''}${e.stderr ?? ''}`.trim() || null,
+  };
+}
+
 // ── Git metadata ──────────────────────────────────────────────────────────────
 const commit = git('rev-parse HEAD');
 const tag = git('describe --tags --exact-match 2>/dev/null') || `v${version}`;
@@ -137,6 +183,8 @@ const manifest = {
   },
   contracts: {
     abi_sha256: abiHashes,
+    upgradeability: contractUpgradeability,
+    compatibility_check: compatibilityCheck,
   },
   rollback: {
     docs: 'docs/releases/rollback.md',

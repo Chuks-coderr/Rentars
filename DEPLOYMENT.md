@@ -344,11 +344,20 @@ Perform the following before mainnet launch:
 
 ### 7.3 Contract rollback
 
-Smart contracts on Stellar are immutable. If a contract bug is discovered in production:
+Soroban contracts are immutable once deployed: a deployed contract's WASM cannot be
+patched in place. The upgrade and migration policy — which contracts are
+upgradeable, who may authorize an upgrade, how stored state and clients migrate,
+and the rollback/forward-fix plan — is defined in section 7.10 and in
+[`docs/releases/rollback.md`](docs/releases/rollback.md). In short, recovery from a
+contract defect is one of:
 
-- Deploy a new contract version with a patched ABI
-- Update `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and `REVIEW_CONTRACT_ID` in the backend
-- Verify cross-contract calls and initialization again
+- **Upgradeable contracts**: authorize an upgrade to a new WASM through the
+  contract's admin/timelock path, running the tested state migration first.
+- **Immutable contracts**: deploy a new contract version with a patched ABI,
+  migrate state if a migration entry point exists, then update
+  `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and `REVIEW_CONTRACT_ID`
+  in the backend.
+- Verify cross-contract calls and initialization again.
 
 If contract addresses are updated, also update any frontend endpoints or settings that rely on them.
 
@@ -648,6 +657,150 @@ aws secretsmanager get-secret-value --secret-id prod/db/password | jq -r '.Secre
 
 ---
 
+## 7.10 Contract Upgrade and Migration Policy
+
+Deployed Soroban contracts and their stored state may outlive application
+versions. This section is the authoritative policy for immutable deployment,
+upgrade authorization, state migration, and client compatibility. Client
+compatibility rules are detailed in
+[`docs/releases/compatibility.md`](docs/releases/compatibility.md); rollback
+ownership and irreversible operations are in
+[`docs/releases/rollback.md`](docs/releases/rollback.md).
+
+### 7.10.1 Upgradeability classification
+
+Every contract must be classified before mainnet deployment and the
+classification recorded alongside its contract ID.
+
+| Contract | Upgradeable | Upgrade authority | Notes |
+|---|---|---|---|
+| `property-listing` | No (immutable) | n/a | Deploy a new instance and migrate listings; backend points at the new ID |
+| `booking` | No (immutable) | n/a | Holds escrow-linked state; never upgrade in place — deploy new instance, migrate, then cut over |
+| `review-contract` | No (immutable) | n/a | Deploy a new instance; reviews are append-only and can be replayed |
+
+If a future contract is made upgradeable, it must expose an explicit admin
+field and an `upgrade` entry point guarded by that admin, and the table above
+must be updated in the same change. An upgradeable contract without a
+documented admin and timelock is not eligible for mainnet.
+
+### 7.10.2 Admin and timelock controls
+
+- **Admin identity**: the admin is a dedicated Stellar account, separate from
+  the deployer account, recorded in the secrets manager. The admin public key is
+  recorded with the contract ID.
+- **Timelock**: any upgrade or migration entry point must be gated behind a
+  timelock (minimum 48 hours on mainnet) so operators and users can observe the
+  pending change. The timelock duration is recorded with the contract metadata.
+- **Multi-approval**: authorizing an upgrade requires two approvers (contract
+  owner and security reviewer), mirroring the rollback approval rules in
+  [`docs/releases/rollback.md`](docs/releases/rollback.md).
+- **Key rotation**: admin keys are rotated on a documented schedule and
+  immediately after any suspected compromise; rotation is recorded in the
+  incident log.
+
+### 7.10.3 Emergency procedures
+
+If a contract defect is discovered in production:
+
+1. **Contain**: pause dependent backend write paths (bookings, payments) via
+   feature flags; do not attempt an in-place patch.
+2. **Assess**: determine whether the defect affects stored state. If state is
+   corrupted, stop all writes to the affected contract immediately.
+3. **Decide**: choose upgrade (only for upgradeable contracts, after the
+   timelock) or new-instance deployment with state migration (immutable
+   contracts).
+4. **Notify**: alert on-call, security, and product; open an incident record.
+5. **Execute**: follow the migration and cut-over steps in 7.10.4–7.10.6.
+6. **Verify**: run the post-deployment verification in section 2.2 and the
+   compatibility check in 7.10.7.
+7. **Post-mortem**: required within 24 hours, including whether the timelock
+   should be shortened or lengthened.
+
+Emergency changes still require two approvers; the timelock may only be bypassed
+with explicit security-lead sign-off recorded in the incident.
+
+### 7.10.4 State migration approach
+
+State migration is supported only where the contract exposes versioned storage
+keys or an explicit migration entry point. Do not attempt to rewrite contract
+storage from outside the contract.
+
+- **Versioned storage keys**: contracts that persist state must namespace keys
+  with a schema version (e.g. `DataKey::V2(...)`). A migration entry point reads
+  old-version keys, writes new-version keys, and leaves old keys readable until
+  the cut-over is confirmed.
+- **Migration entry point**: where supported, expose an admin-guarded
+  `migrate(from_version, to_version)` that is idempotent and safe to re-run.
+- **Contracts without migration support**: treat as immutable and migrate by
+  deploying a new instance and replaying state from the backend's authoritative
+  records (database), then switching the contract ID.
+- **Backend schema**: database migrations follow section 4.2 and the
+  compatibility rules in section 7.7.
+
+### 7.10.5 Sandbox migration testing
+
+Every supported migration must be tested against old state before release:
+
+```bash
+# 1. Start a local Soroban sandbox network
+stellar network start local
+
+# 2. Deploy the OLD contract version and seed representative state
+stellar contract deploy --wasm target/wasm32-unknown-unknown/release/<contract>-old.wasm \
+  --source "$SANDBOX_ADMIN" --network local
+# ... invoke initialize and seed fixtures ...
+
+# 3. Deploy the NEW contract version and run the migration entry point
+stellar contract invoke --id "$NEW_CONTRACT_ID" --source "$SANDBOX_ADMIN" --network local \
+  -- migrate --from_version 1 --to_version 2
+
+# 4. Assert migrated state matches expectations (read-back checks)
+stellar contract invoke --id "$NEW_CONTRACT_ID" --source "$SANDBOX_ADMIN" --network local \
+  -- get_state_summary
+
+# 5. Re-run the migration to confirm idempotency
+stellar contract invoke --id "$NEW_CONTRACT_ID" --source "$SANDBOX_ADMIN" --network local \
+  -- migrate --from_version 1 --to_version 2
+```
+
+Record the sandbox run (contract IDs, migration output, read-back results) in the
+release ticket. A migration without a recorded sandbox run is not eligible for
+mainnet.
+
+### 7.10.6 Rollback and forward-fix plan
+
+- **Upgradeable contracts**: roll back by authorizing an upgrade to the previous
+  WASM through the same admin/timelock path. The previous WASM and its storage
+  schema version must be retained.
+- **Immutable contracts**: roll back by pointing the backend back at the
+  previous contract ID (section 7.3). State written to the new instance after
+  cut-over must be reconciled from the backend's authoritative records.
+- **Forward-fix**: preferred over rollback when state has already been written
+  under the new schema. Deploy a corrected version and run the migration again;
+  migrations must be idempotent to support this.
+- **Decision ownership**: who may authorize rollback versus forward-fix, and
+  which operations are irreversible, is defined in
+  [`docs/releases/rollback.md`](docs/releases/rollback.md).
+
+### 7.10.7 Deployment-time compatibility check
+
+Client and contract incompatibility must be detected before release. Run the
+compatibility check as part of the deployment pipeline, after the backend
+contract tests and before promotion:
+
+```bash
+# Verify backend client assumptions match the deployed contract ABI/version
+cd apps/backend && bun run check:contract-compatibility
+```
+
+The check compares the backend's expected contract versions and ABI against the
+deployed contract IDs and fails the deployment on mismatch. The rules it
+enforces are documented in
+[`docs/releases/compatibility.md`](docs/releases/compatibility.md). A failed
+check blocks promotion; do not bypass it.
+
+---
+
 ## 8. Monitoring and Alerting
 
 ### 8.1 Release State Tracking
@@ -803,5 +956,8 @@ To confirm deployments are production-ready, verify:
 9. ✅ Health gates monitoring configured in observability platform
 10. ✅ Rollback approval process requires 2 approvers for production
 11. ✅ No commands expose signing secrets in logs or CLI arguments
+12. ✅ Every contract's upgradeability and upgrade authority is documented (section 7.10.1)
+13. ✅ Any supported upgrade has a tested sandbox state migration and a rollback/forward-fix plan
+14. ✅ The deployment-time compatibility check (section 7.10.7) passes before promotion
 
 If all checks are satisfied, deployment automation is production-ready.
