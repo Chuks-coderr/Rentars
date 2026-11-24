@@ -104,51 +104,45 @@ for (const abi of abiFiles) {
   }
 }
 
-// ── Contract upgradeability and upgrade authority ────────────────────────────
-// Mirrors the environment variables consumed by the backend contractRegistry so
-// operators can tell, from a release manifest alone, whether a deployed contract
-// can be upgraded and who may authorize it.
-const contractUpgradeability: Record<
-  string,
-  { upgradeable: boolean; upgrade_authority: string | null }
-> = {
-  property_listing: {
-    upgradeable: (process.env.PROPERTY_LISTING_UPGRADEABLE ?? 'false').toLowerCase() === 'true',
-    upgrade_authority: process.env.PROPERTY_LISTING_UPGRADE_AUTHORITY ?? null,
-  },
-  booking: {
-    upgradeable: (process.env.BOOKING_UPGRADEABLE ?? 'false').toLowerCase() === 'true',
-    upgrade_authority: process.env.BOOKING_UPGRADE_AUTHORITY ?? null,
-  },
-  review: {
-    upgradeable: (process.env.REVIEW_UPGRADEABLE ?? 'false').toLowerCase() === 'true',
-    upgrade_authority: process.env.REVIEW_UPGRADE_AUTHORITY ?? null,
-  },
-};
-
-// ── Contract compatibility check ─────────────────────────────────────────────
-// Runs the compatibility check script and records its outcome in the manifest so
-// client/contract incompatibility is visible before release.
-let compatibilityCheck: { status: string; exit_code: number | null; output: string | null } = {
-  status: 'not_run',
-  exit_code: null,
-  output: null,
-};
-try {
-  const output = execSync('bun run scripts/check-contract-compatibility.ts', {
-    cwd: ROOT,
-    encoding: 'utf-8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
-  compatibilityCheck = { status: 'passed', exit_code: 0, output };
-} catch (err) {
-  const e = err as { status?: number | null; stdout?: string; stderr?: string };
-  compatibilityCheck = {
-    status: 'failed',
-    exit_code: e.status ?? null,
-    output: `${e.stdout ?? ''}${e.stderr ?? ''}`.trim() || null,
-  };
+// ── Migration checksum / validation results ──────────────────────────────────
+// These are produced by the migration tooling and written to a well-known
+// results file (or supplied via env) so the manifest can link version,
+// migration state and health results for each deployment.
+function readJsonIfExists(rel: string): Record<string, unknown> | null {
+  if (!existsSync(resolve(ROOT, rel))) return null;
+  try {
+    return json(rel);
+  } catch {
+    return null;
+  }
 }
+
+const migrationChecksums =
+  readJsonIfExists('docs/releases/migration-checksums.json') ??
+  (process.env.MIGRATION_CHECKSUMS_JSON
+    ? (JSON.parse(process.env.MIGRATION_CHECKSUMS_JSON) as Record<string, unknown>)
+    : null);
+
+const migrationValidation =
+  readJsonIfExists('docs/releases/migration-validation.json') ??
+  (process.env.MIGRATION_VALIDATION_JSON
+    ? (JSON.parse(process.env.MIGRATION_VALIDATION_JSON) as Record<string, unknown>)
+    : null);
+
+// ── Health gate results ──────────────────────────────────────────────────────
+// Smoke-test results are written by the deployment health gate runner. The
+// manifest records the decision (pass/fail) and the per-check outcomes so a
+// deployment record can be audited against the gate policy.
+const healthResults =
+  readJsonIfExists('docs/releases/health-results.json') ??
+  (process.env.HEALTH_RESULTS_JSON
+    ? (JSON.parse(process.env.HEALTH_RESULTS_JSON) as Record<string, unknown>)
+    : null);
+
+const healthDecision: 'pass' | 'fail' | 'not_run' =
+  healthResults && typeof healthResults.decision === 'string'
+    ? (healthResults.decision as 'pass' | 'fail')
+    : 'not_run';
 
 // ── Git metadata ──────────────────────────────────────────────────────────────
 const commit = git('rev-parse HEAD');
@@ -172,6 +166,20 @@ const manifest = {
   database: {
     latest_migration: latestMigration,
     migration_count: migrationCount,
+    checksums: migrationChecksums
+      ? {
+          status: migrationChecksums.status ?? 'unknown',
+          checked_at: migrationChecksums.checked_at ?? null,
+          mismatches: migrationChecksums.mismatches ?? [],
+        }
+      : null,
+    validation: migrationValidation
+      ? {
+          status: migrationValidation.status ?? 'unknown',
+          checked_at: migrationValidation.checked_at ?? null,
+          errors: migrationValidation.errors ?? [],
+        }
+      : null,
   },
   dependencies: {
     stellar_network: process.env.STELLAR_NETWORK ?? null,
@@ -185,6 +193,16 @@ const manifest = {
     abi_sha256: abiHashes,
     upgradeability: contractUpgradeability,
     compatibility_check: compatibilityCheck,
+  },
+  health: {
+    decision: healthDecision,
+    results: healthResults
+      ? {
+          generated_at: healthResults.generated_at ?? null,
+          environment: healthResults.environment ?? null,
+          checks: healthResults.checks ?? [],
+        }
+      : null,
   },
   rollback: {
     docs: 'docs/releases/rollback.md',
