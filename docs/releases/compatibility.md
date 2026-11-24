@@ -104,3 +104,72 @@ BASE_SHA=<prior-commit> bash scripts/check-abi-migration-changelog.sh
 ```
 
 Do not bypass the check with `git commit --no-verify`.
+
+## Dependency compatibility and exceptions
+
+Dependency updates are governed by the policy in
+[`DEPLOYMENT.md`](../../DEPLOYMENT.md) and are scanned by the
+[`dependency-audit` workflow](../../../.github/workflows/dependency-audit.yml).
+This section covers the compatibility expectations that apply on top of that
+policy.
+
+### Runtime-sensitive packages
+
+The following packages are **runtime-sensitive**: a major-version bump (or, in
+some cases, a minor bump) can change runtime behavior, wire formats, or
+deployment requirements.  They must **not** be included in grouped automated
+updates and must be upgraded in dedicated PRs with the relevant tests passing.
+
+| Component | Package(s) | Why it is sensitive |
+|---|---|---|
+| Frontend framework | `next`, `react`, `react-dom` | App Router / RSC behavior, build output, routing |
+| Wallet SDK | `@stellar/stellar-sdk`, `@stellar/freighter-api`, wallet-kit packages | Transaction signing, XDR encoding, network passphrase handling |
+| Database client | `@supabase/supabase-js`, `pg` / `postgres` | Query semantics, connection pooling, auth token handling |
+| Backend runtime | `express`, `redis` / `ioredis` | Middleware ordering, session/cache key formats |
+| Media pipeline | `sharp` | Native binary ABI, image encoding output |
+| Contracts | Soroban crates (`soroban-sdk`, `stellar-*`) in `apps/contracts/Cargo.toml` | On-chain ABI, WASM size limits, host function availability |
+
+Low-risk patch/minor updates to non-sensitive packages may be grouped (see the
+policy in `DEPLOYMENT.md`).  Major updates and any update to the packages above
+are always separate PRs.
+
+### Required tests for updates
+
+Every dependency update PR must pass the checks relevant to the component it
+touches before merge:
+
+- **Backend** — `bun test` in `apps/backend`, plus the migration/ABI changelog
+  check if schema or contract files change.
+- **Frontend** — `yarn test` and `yarn build` in `apps/web` (a build failure is
+  the most common signal of a Next.js/React incompatibility).
+- **Contracts** — `cargo test` and `cargo build --target wasm32-unknown-unknown`
+  in `apps/contracts`; verify the resulting WASM size stays within the network
+  limit.
+- **Wallet SDK / database client** — run the integration tests that exercise
+  signing and query paths, not just unit tests.
+
+An update that changes a lockfile must commit the updated lockfile
+(`bun.lockb`, `yarn.lock`, or `Cargo.lock`) in the same PR so builds remain
+reproducible.
+
+### Approved exceptions
+
+A vulnerability that cannot be remediated immediately (no fixed version, or a
+fix blocked by a runtime-sensitive upgrade) may be granted a time-boxed
+exception.  Exceptions are **documented, not silently ignored**.  Record each
+one in the table below:
+
+| Advisory | Package | Severity | Reason for exception | Owner | Expires |
+|---|---|---|---|---|---|
+| _(none)_ | | | | | |
+
+Rules for exceptions:
+
+- Every exception has a named **owner** and an **expiration date** (no more than
+  90 days out).
+- The `dependency-audit` workflow fails once an exception passes its expiration
+  date, forcing review.
+- Exceptions are reviewed at each release; an expired or stale exception must be
+  renewed with justification or resolved.
+- Exceptions affecting runtime-sensitive packages require sign-off from the
+  component owner listed in `DEPLOYMENT.md`.
