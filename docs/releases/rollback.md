@@ -2,6 +2,32 @@
 
 This runbook covers how a Rentars release is judged healthy, who decides when it is paused or rolled back, what cannot be undone, and how the rollback itself is rehearsed. The numeric thresholds live in [`health-gates.json`](./health-gates.json); [DEPLOYMENT.md](../../DEPLOYMENT.md) section 7.6 describes them in prose.
 
+## Promotion gates
+
+No release shifts production traffic until the required gates pass. Gates run in two phases:
+
+**Preflight (before any production traffic).** Run against the candidate build in staging or a preview environment:
+
+| Gate | What it proves | How it is checked |
+|------|----------------|-------------------|
+| API readiness | Backend boots, `/health` and `/ready` report ready, dependencies reachable | `SMOKE_API_URL=... yarn workspace web playwright test e2e/smoke.spec.ts --grep @health` |
+| Frontend availability | Frontend serves the app shell and can reach the API | `SMOKE_FRONTEND_URL=...` smoke run |
+| Auth metadata | Auth endpoints return expected metadata (issuer, JWKS, scopes) without a real login | Smoke `@auth-metadata` checks |
+| Database compatibility | Current head matches the manifest's `database.latest_migration`; no pending or incompatible migrations | Compare `database.latest_migration` / `database.migration_count` with the deployed head |
+| Payment configuration | Payment provider keys, webhook secrets and contract IDs are present and point at the intended network | Smoke `@payments-config` checks; never submits a real charge |
+
+**Post-deploy (canary, before full promotion).** Run against the canary once it receives a slice of traffic:
+
+| Gate | What it proves | How it is checked |
+|------|----------------|-------------------|
+| Health gates | Error rate, latency, DB pool, Redis and contract metrics are within policy | `scripts/release-health-gate.ts` (see below) |
+| Property read | A real listing can be read end-to-end | Smoke `@property-read` |
+| Payment path | A mocked or testnet payment completes without spending production funds | Smoke `@payment-testnet` against the testnet/mock provider |
+
+A failed **required** gate blocks promotion: hold canary traffic at its current level and alert on-call. If the failure is a `rollback` gate, start the rollback procedure below. The smoke suite must be environment-safe: it uses read-only fixtures, a mocked payment provider or the Stellar testnet, and must never create real bookings or transfer production funds. Any test that would write production data is skipped unless an explicit test-environment flag is set.
+
+Promotion is gated on the recorded results. The release manifest's `health` block records the preflight and post-deploy gate outcomes (pass/fail per gate, timestamps, and the `policy_sha256` in force) alongside `version`, `database.latest_migration` and `database.migration_count`. A release is not promoted unless every required gate is recorded as passing.
+
 ## Ownership
 
 | Decision | Owner | Notes |
@@ -67,11 +93,11 @@ cat docs/releases/manifest-1.2.3.json | jq .
 
 ## Rollback procedure
 
-1. **Identify the target manifest.** Choose the last known-good version. Use `rollback.previous_manifest` as the default.
-2. **Check irreversible operations.** Before any rollback, confirm the change list in [Irreversible operations](#irreversible-operations). If the current release applied an irreversible migration or moved a contract, the rollback plan is different.
-3. **Check database compatibility.** Compare `database.latest_migration` and `database.migration_count` in the target manifest with the current head. If the current head is ahead, a database downgrade is required (see migration runbooks in `docs/admin-runbooks.md`).
+1. **Identify the target manifest.** Choose the last known-good version. Use `rollback.previous_manifest` as the default. The manifest's `version`, `database.latest_migration` and `database.migration_count` define the exact state to restore.
+2. **Check irreversible operations.** Before any rollback, confirm the change list in [Irreversible operations](#irreversible-operations). If the current release applied an irreversible migration or moved a contract, a plain image rollback is not sufficient — follow the schema/contract constraints below.
+3. **Check database compatibility.** Compare `database.latest_migration` and `database.migration_count` in the target manifest with the current head. If the current head is ahead, a database downgrade is required (see migration runbooks in `docs/admin-runbooks.md`). If the current release ran a destructive or data-rewriting migration, the downgrade cannot restore lost data; restore from the backup taken before the release instead.
 4. **Re-deploy the Docker image.** Use `release.image_tag` from the target manifest to pull and re-deploy the backend and frontend images.
-5. **Verify dependencies.** Confirm the deployed frontend and backend point at the contract IDs in `dependencies.contract_ids` and the network in `dependencies.stellar_network`. If `components.contracts.version` differs, ABI SHA-256 hashes in `contracts.abi_sha256` confirm the correct ABI files are loaded.
+5. **Verify dependencies.** Confirm the deployed frontend and backend point at the contract IDs in `dependencies.contract_ids` and the network in `dependencies.stellar_network`. If `components.contracts.version` differs, ABI SHA-256 hashes in `contracts.abi_sha256` confirm the correct ABI files are loaded. Contracts are immutable: if the current release deployed a new contract address, rolling back the image does not move the contract back — repoint the contract IDs and verify cross-contract calls, or fix forward.
 6. **Clear caches.** Flush feature-flag and configuration caches as described in DEPLOYMENT.md section 7.8. Do not flush user session caches.
 7. **Smoke test.** After deployment, run the preview smoke suite:
    ```bash
@@ -79,8 +105,25 @@ cat docs/releases/manifest-1.2.3.json | jq .
    SMOKE_FRONTEND_URL=https://your-env.example.com \
    yarn workspace web playwright test e2e/smoke.spec.ts
    ```
-   Core reads (listings, booking lookup) and reconciliation must recover before the rollback is closed.
-8. **Update the incident record.** Note the rollback in the incident tracker with the manifest version, the gate that triggered it, and the reason.
+   Core reads (listings, booking lookup), the payment-config check and reconciliation must recover before the rollback is closed.
+8. **Verify against the manifest.** Confirm the restored environment matches the target manifest: `version`, `database.latest_migration`, `database.migration_count`, `dependencies.contract_ids` and `contracts.abi_sha256`. Record the post-rollback health-gate results next to the original preflight/post-deploy results.
+9. **Update the incident record.** Note the rollback in the incident tracker with the manifest version, the gate that triggered it, the migration state before and after, and the reason.
+
+## Schema and contract rollback constraints
+
+- **Destructive migrations** (`DROP COLUMN`, `DROP TABLE`, data rewrites) cannot be undone by re-deploying an older image. Roll back by restoring the pre-release backup, and only after confirming the target manifest's migration state.
+- **Additive migrations** are backward compatible: the previous image can run against the newer schema, so an image rollback is safe without a downgrade.
+- **Contract changes** are immutable. A redeployed contract has a new address and cannot be reverted; the rollback path is to repoint the contract IDs back to the previous addresses (if still valid) or fix forward with a new deployment.
+- If any of these constraints applies, the rollback plan must be written and rehearsed (see [Staging rollback rehearsal](#staging-rollback-rehearsal)) before the release ships.
+
+## Fix-forward
+
+When a rollback is unsafe (irreversible migration already applied, contract already moved, on-chain transactions already submitted), fix forward instead:
+
+1. Keep the canary held; do not promote further traffic.
+2. Ship a minimal corrective release that restores the failing gate, with its own preflight and post-deploy gates.
+3. Reconcile on-chain state against the ledger; never replay transactions blindly.
+4. Record the fix-forward in the incident tracker with the failing gate, the corrective version, and the resulting health-gate results.
 
 ## Irreversible operations
 
@@ -103,7 +146,8 @@ A rollback that has not been rehearsed is not a plan. Before each production rel
 1. Deploy the candidate release to staging and let the manifest be generated (`scripts/generate-release-manifest.ts`).
 2. Deploy the previous manifest's image tag to staging, then roll forward to the candidate again.
 3. Replay the rollback with the gate evaluator. Feed it a `rollback` snapshot (for example a sustained `transaction_failure_ratio` above 0.02) and confirm the decision is `rollback` with exit code `20`.
-4. Run the smoke suite after rollback. Confirm that listings, booking reads, and reconciliation recover.
-5. Save the rehearsal record: both manifest files, the gate output, and the smoke results. Attach it to the release ticket.
+4. Run the smoke suite after rollback. Confirm that listings, booking reads, the payment-config check, and reconciliation recover.
+5. Verify the restored environment against the target manifest's `version`, `database.latest_migration` and `database.migration_count`.
+6. Save the rehearsal record: both manifest files, the gate output, the smoke results, and the post-rollback health-gate results. Attach it to the release ticket.
 
 Record the rehearsal date and the staging result in the release ticket before the production rollout starts.

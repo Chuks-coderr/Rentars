@@ -137,7 +137,81 @@ curl -sfI "$FRONTEND_URL" | head -1
 
 ---
 
+### 2.3 Deployment health gates (promotion blockers)
+
+A release must not receive production traffic until every required gate below
+passes. Gates are evaluated by `scripts/deploy-smoke.ts` (see
+`docs/releases/smoke-checks.md` for the full check list and exit codes) and the
+result is written to the release manifest. Exit codes: `0` = pass (promote),
+`10` = blocked (hold traffic on the previous version), `20` = rollback.
+
+**Environment safety:** every smoke check is read-only or uses simulation. No
+check may create a real booking, charge a card, or transfer funds. Payment
+checks run against Stellar testnet or a mocked payment provider only, and the
+script refuses to run payment checks when `STELLAR_NETWORK=mainnet` unless
+`PAYMENT_SMOKE_MODE=simulate` is set. Smoke checks must never be run with
+production service-role keys that can write to live tables.
+
+#### Preflight gates (before deploying)
+
+| Gate | Check | Pass condition |
+|---|---|---|
+| API readiness | `GET $BACKEND_URL/health` and `/health/deep` on the candidate build in staging | `status: ok`, all dependencies `connected` |
+| Frontend availability | `curl -sfI $FRONTEND_URL` on the preview deployment | HTTP 200, expected build/commit header |
+| Database compatibility | `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f setup.sql` dry run against a restored snapshot, plus `bun run test:contract` | migrations apply cleanly, no undocumented API changes |
+| Payment configuration | `PAYMENT_SMOKE_MODE=simulate bun run test:payments` | provider keys present, simulated intent succeeds, no live charge |
+
+#### Post-deploy gates (before traffic promotion)
+
+| Gate | Check | Pass condition |
+|---|---|---|
+| API readiness | `curl -sf "$BACKEND_URL/health" \| jq .` and `/health/deep` | `status: ok`, dependencies `connected` |
+| Auth metadata | `curl -s -o /dev/null -w '%{http_code}' "$BACKEND_URL/api/v1/bookings"` | `401` (auth guard active) |
+| Property read | `curl -sf "$BACKEND_URL/api/v1/properties?limit=1" \| jq '.data \| length'` | `200` + JSON array |
+| Frontend availability | `curl -sfI "$FRONTEND_URL" \| head -1` | HTTP 200 |
+| Database compatibility | migration version matches the release manifest; read-only query succeeds | versions equal, query returns |
+| Payment configuration | simulated payment path on testnet/mock | success, zero real funds moved |
+
+**Promotion rule:** traffic promotion (canary → 100%) is blocked while any
+required gate is failing or unrecorded. A failed required gate either holds the
+release on the previous version or, if the failure is in a gate marked
+`rollback` in `docs/releases/health-gates.json`, triggers the rollback runbook
+in §7.9. Gates are re-run after any rollback before traffic is restored.
+
+#### Rollback constraints for schema and contract changes
+
+- **Schema:** migrations are forward-only in production. Roll back by restoring
+  the pre-release backup (§7.4); do not hand-write down-migrations on live data.
+  Destructive changes (drop/rename) must ship one release after the code that
+  stops using them (§7.7).
+- **Contracts:** Soroban contracts are immutable. A contract defect cannot be
+  rolled back in place — use the fix-forward path in §7.3 (deploy a patched
+  contract, update contract IDs, re-run post-deploy gates) or restore the
+  previous contract IDs in the backend environment.
+- **Fix-forward:** when a rollback is unsafe (e.g. a migration already applied
+  and depended on by new data), document the decision in the release record,
+  ship a forward fix behind a feature flag, and keep the failing gate red until
+  the fix passes.
+
+#### Release manifest
+
+Every deployment writes a release manifest (see
+`docs/releases/release-manifest.schema.json`) recording:
+
+- `version` and `commit` — the deployed build
+- `migration_state` — applied migration version / `setup.sql` checksum
+- `contract_ids` — property listing, booking, review
+- `health_results` — per-gate status, observed value, timestamp, and the
+  `deploy-smoke.ts` exit code
+- `rollback` — whether a rollback or fix-forward was taken, with approvers
+
+The manifest is the source of truth for §8.1 release state tracking; a release
+without a complete manifest is not considered promoted.
+
+---
+
 ## 3. Stellar Testnet Setup
+=======
 
 ### 3.1 Create and fund testnet accounts
 
