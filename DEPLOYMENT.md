@@ -497,11 +497,20 @@ Perform the following before mainnet launch:
 
 ### 7.3 Contract rollback
 
-Smart contracts on Stellar are immutable. If a contract bug is discovered in production:
+Soroban contracts are immutable once deployed: a deployed contract's WASM cannot be
+patched in place. The upgrade and migration policy — which contracts are
+upgradeable, who may authorize an upgrade, how stored state and clients migrate,
+and the rollback/forward-fix plan — is defined in section 7.10 and in
+[`docs/releases/rollback.md`](docs/releases/rollback.md). In short, recovery from a
+contract defect is one of:
 
-- Deploy a new contract version with a patched ABI
-- Update `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and `REVIEW_CONTRACT_ID` in the backend
-- Verify cross-contract calls and initialization again
+- **Upgradeable contracts**: authorize an upgrade to a new WASM through the
+  contract's admin/timelock path, running the tested state migration first.
+- **Immutable contracts**: deploy a new contract version with a patched ABI,
+  migrate state if a migration entry point exists, then update
+  `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and `REVIEW_CONTRACT_ID`
+  in the backend.
+- Verify cross-contract calls and initialization again.
 
 If contract addresses are updated, also update any frontend endpoints or settings that rely on them.
 

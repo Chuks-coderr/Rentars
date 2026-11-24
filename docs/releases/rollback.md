@@ -125,6 +125,51 @@ When a rollback is unsafe (irreversible migration already applied, contract alre
 3. Reconcile on-chain state against the ledger; never replay transactions blindly.
 4. Record the fix-forward in the incident tracker with the failing gate, the corrective version, and the resulting health-gate results.
 
+## Contract rollback and forward-fix
+
+Soroban contracts are not rolled back by re-deploying an older Docker image. The backend image and the on-chain contract version move independently, and a contract upgrade may already have migrated stored state. The upgrade policy (which contracts are upgradeable, who may authorize an upgrade, and how state and clients migrate) is in [`docs/contracts/upgrade-policy.md`](../contracts/upgrade-policy.md). This section covers the rollback side of that policy.
+
+### Identifying whether a contract was upgraded
+
+1. **Compare manifests.** `components.contracts.version` and `contracts.abi_sha256` in the current manifest must match the target manifest. A differing version or ABI hash means a contract changed between the two releases.
+2. **Compare contract IDs.** If `dependencies.contract_ids` differ between manifests, the release deployed a new contract address rather than upgrading in place. That is the "Stellar contract redeploy" row in [Irreversible operations](#irreversible-operations), not an upgrade.
+3. **Confirm on-chain.** Read the deployed contract's version and admin from the network recorded in `dependencies.stellar_network`:
+   ```bash
+   stellar contract invoke --id "$PROPERTY_LISTING_CONTRACT_ID" --network "$STELLAR_NETWORK" -- version
+   stellar contract invoke --id "$PROPERTY_LISTING_CONTRACT_ID" --network "$STELLAR_NETWORK" -- admin
+   ```
+   The reported version must match the manifest. If it does not, the manifest is stale: stop and reconcile before continuing.
+4. **Check the upgrade record.** Every authorized upgrade is logged with the approving admin, the timelock expiry, the old and new WASM hashes, and the migration entry point that ran. The record is attached to the release ticket.
+
+### Restoring the prior WASM
+
+Only contracts marked upgradeable in the upgrade policy can be restored. Immutable contracts cannot be changed; the only remedy is a new deployment and a client repoint.
+
+1. **Locate the prior WASM.** The release manifest records `contracts.wasm_sha256` for each contract. The matching WASM artifact is attached to the prior release and stored alongside the manifest. Verify the hash before use:
+   ```bash
+   sha256sum property-listing.wasm
+   ```
+2. **Confirm the admin and timelock.** The restore is an upgrade and follows the same authorization as a forward upgrade: the contract admin submits it, and the timelock must elapse before it takes effect. Emergency restores still require the admin key; there is no bypass.
+3. **Check state compatibility first.** A WASM restore does not revert storage. If the forward upgrade ran a state migration, the older WASM may not read the migrated state. Consult the migration notes in the upgrade policy:
+   - **Additive migration** (new keys, old keys untouched): the prior WASM is safe to restore.
+   - **Destructive migration** (keys rewritten or removed): the prior WASM is not safe. Use a forward-fix instead.
+4. **Submit the restore** through the same upgrade entry point used for the forward upgrade, pointing at the prior WASM hash. Record the restore in the upgrade log.
+5. **Verify.** Re-run the version and admin reads above, confirm the reported version matches the target manifest, and run the smoke suite. Cross-contract calls must succeed before the rollback is closed.
+
+### Irreversible state migrations
+
+A contract state migration that rewrites or removes keys cannot be undone by restoring the prior WASM. Treat it like a data-rewriting database migration:
+
+| Migration kind | Rollback path |
+|----------------|---------------|
+| Additive (new keys only) | Restore the prior WASM; old keys are still readable. |
+| Dual-write (old and new keys written) | Restore the prior WASM, then run the documented cleanup entry point once the old version is stable. |
+| Destructive (keys rewritten or removed) | No WASM restore. Ship a forward-fix contract that reads the migrated state, or restore from a ledger snapshot taken before the upgrade. |
+
+Before shipping any destructive migration, take a ledger snapshot or export of the affected contract storage and attach it to the release ticket. The forward-fix contract must be built, tested against a copy of the migrated state in a sandbox, and reviewed by the contract admin before submission.
+
+If neither a forward-fix nor a snapshot restore is available, escalate to the release manager and the contract admin. Do not attempt to replay on-chain transactions to compensate; reconcile against the ledger instead (see [Irreversible operations](#irreversible-operations)).
+
 ## Irreversible operations
 
 These steps cannot be undone by re-deploying an older image. Each one needs an explicit plan before the release that contains it ships.

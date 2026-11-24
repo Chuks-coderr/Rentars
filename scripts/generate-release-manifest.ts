@@ -191,6 +191,8 @@ const manifest = {
   },
   contracts: {
     abi_sha256: abiHashes,
+    upgradeability: contractUpgradeability,
+    compatibility_check: compatibilityCheck,
   },
   health: {
     decision: healthDecision,
